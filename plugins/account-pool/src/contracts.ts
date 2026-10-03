@@ -5,6 +5,8 @@ export const DEFAULT_ACCOUNT_POOL_CONFIG = {
   codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
   switchThreshold: 0.98,
   parentMode: "proxy" as const,
+  selectionOrder: "priority" as const,
+  resetSwitchMarginHours: 12,
 };
 
 const httpUrlSchema = z.string().refine((value) => {
@@ -23,6 +25,19 @@ const switchThresholdSchema = z
 
 export const parentModeSchema = z.enum(["proxy", "isolate"]);
 
+export const selectionOrderSchema = z.enum(["priority", "reset"]);
+export type SelectionOrder = z.infer<typeof selectionOrderSchema>;
+
+const resetSwitchMarginHoursSchema = z
+  .number()
+  .min(0, "Must be at least 0.")
+  .max(168, "Must be at most 168.");
+
+const resetOffsetHoursSchema = z
+  .number()
+  .min(-168, "Must be at least -168.")
+  .max(168, "Must be at most 168.");
+
 export const accountPoolConfigSchema = z
   .object({
     anthropicUpstreamBaseUrl: httpUrlSchema.default(
@@ -37,6 +52,12 @@ export const accountPoolConfigSchema = z
     parentMode: parentModeSchema.default(
       DEFAULT_ACCOUNT_POOL_CONFIG.parentMode,
     ),
+    selectionOrder: selectionOrderSchema.default(
+      DEFAULT_ACCOUNT_POOL_CONFIG.selectionOrder,
+    ),
+    resetSwitchMarginHours: resetSwitchMarginHoursSchema.default(
+      DEFAULT_ACCOUNT_POOL_CONFIG.resetSwitchMarginHours,
+    ),
   })
   .strict();
 
@@ -48,6 +69,8 @@ export const accountPoolConfigSetInputSchema = z
     codexUpstreamBaseUrl: httpUrlSchema.optional(),
     switchThreshold: switchThresholdSchema.optional(),
     parentMode: parentModeSchema.optional(),
+    selectionOrder: selectionOrderSchema.optional(),
+    resetSwitchMarginHours: resetSwitchMarginHoursSchema.optional(),
   })
   .strict();
 
@@ -143,6 +166,7 @@ export const accountSchema = z
     rateLimitTier: z.string().nullable(),
     enabled: z.boolean(),
     priority: z.number().int(),
+    resetOffsetHours: resetOffsetHoursSchema.default(0),
     createdAt: z.number().int().nonnegative(),
     lastUsedAt: z.number().int().nonnegative().nullable().default(null),
     lastUsedHostId: z.string().min(1).nullable().default(null),
@@ -336,6 +360,13 @@ export const accountIdInputSchema = z
 
 export const accountPriorityInputSchema = z
   .object({ accountId: z.string().uuid(), priority: z.number().int() })
+  .strict();
+
+export const accountResetOffsetInputSchema = z
+  .object({
+    accountId: z.string().uuid(),
+    resetOffsetHours: resetOffsetHoursSchema,
+  })
   .strict();
 
 export const accountReorderInputSchema = z

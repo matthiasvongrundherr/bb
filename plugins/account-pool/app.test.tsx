@@ -60,6 +60,7 @@ function account(overrides: Partial<AccountSummary> = {}): AccountSummary {
     rateLimitTier: "default_claude_max_5x",
     enabled: true,
     priority: 100,
+    resetOffsetHours: 0,
     createdAt: 1,
     lastUsedAt: 2,
     lastUsedHostId: "host-one",
@@ -111,6 +112,8 @@ function config(overrides: Partial<AccountPoolConfig> = {}): AccountPoolConfig {
     codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
     switchThreshold: 0.98,
     parentMode: "proxy",
+    selectionOrder: "priority",
+    resetSwitchMarginHours: 12,
     ...overrides,
   };
 }
@@ -449,6 +452,28 @@ describe("Account Pool settings", () => {
         method: "config.set",
         input: { anthropicUpstreamBaseUrl: "https://proxy.example.com" },
       }),
+    );
+  });
+
+  it("saves the reset selection order from the Advanced section", async () => {
+    const slot = render([account()], {
+      "config.set": () => config({ selectionOrder: "reset" }),
+    });
+    fireEvent.click(await slot.findByRole("button", { name: "Advanced" }));
+    const toggle = await slot.findByRole("switch", {
+      name: "Prefer the soonest weekly reset",
+    });
+    await waitFor(() => expect(toggle.hasAttribute("disabled")).toBe(false));
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "config.set",
+        input: { selectionOrder: "reset" },
+      }),
+    );
+    await waitFor(() =>
+      expect(toggle.getAttribute("aria-checked")).toBe("true"),
     );
   });
 

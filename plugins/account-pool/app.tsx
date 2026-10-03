@@ -85,7 +85,10 @@ type DialogState =
   | { kind: "claude-login" | "codex-login" | "api-key" }
   | null;
 
-type ConfigField = Exclude<keyof AccountPoolConfig, "parentMode">;
+type ConfigField = Exclude<
+  keyof AccountPoolConfig,
+  "parentMode" | "selectionOrder" | "resetSwitchMarginHours"
+>;
 
 const PROVIDERS: Array<{
   id: PoolProvider;
@@ -1384,6 +1387,26 @@ function AccountPoolSettings() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") event.currentTarget.blur();
                   }}
+                />
+              </ConfigFieldRow>
+              <ConfigFieldRow
+                label="Prefer the soonest weekly reset"
+                description="Send new conversations to the eligible account whose weekly limit resets first. The current account changes only when another resets at least 12 hours earlier by default."
+                error={null}
+              >
+                <Switch
+                  checked={config?.selectionOrder === "reset"}
+                  disabled={config === null || pending !== null}
+                  aria-label="Prefer the soonest weekly reset"
+                  onCheckedChange={(enabled) =>
+                    void run("selection-order", async () => {
+                      applyConfig(
+                        await rpc.call("config.set", {
+                          selectionOrder: enabled ? "reset" : "priority",
+                        }),
+                      );
+                    })
+                  }
                 />
               </ConfigFieldRow>
               <div className="flex items-start justify-between gap-4">

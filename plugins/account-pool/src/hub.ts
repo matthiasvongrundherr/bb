@@ -29,6 +29,7 @@ import {
   isSharedQuotaExhausted,
   isUsageRestricted,
   retryAfterMilliseconds,
+  sharedWeeklyResetAt,
 } from "./quota.js";
 import type {
   AccountBinding,
@@ -52,6 +53,7 @@ const UPSTREAM_REJECTION_HOLD_MS = 60_000;
 const MAX_FAILURE_DETAIL_BYTES = 1_024;
 const FAILURE_DISPOSAL_TIMEOUT_MS = 250;
 const AFFINITY_IDLE_TTL_MS = 30 * 60 * 1_000;
+const HOUR_MS = 60 * 60 * 1_000;
 const MAX_AFFINITY_BINDINGS = 4_096;
 const DROPPED_RESPONSE_HEADERS = new Set([
   "content-encoding",
@@ -835,7 +837,8 @@ export class AccountPoolHub {
     );
     signal.throwIfAborted();
     const now = this.options.now();
-    const threshold = this.options.getSettings().switchThreshold;
+    const settings = this.options.getSettings();
+    const threshold = settings.switchThreshold;
     const available = accounts
       .filter((account) => account.provider === provider && account.enabled)
       .map((account) => ({
@@ -909,21 +912,41 @@ export class AccountPoolHub {
       ...accounts.slice(anchorIndex + 1),
       ...accounts.slice(0, anchorIndex + 1),
     ];
-    const next = ordered
-      .map((account) =>
-        candidates.find((candidate) => candidate.account.id === account.id),
-      )
-      .find((candidate) => candidate !== undefined);
+    const ring = ordered.flatMap((account) => {
+      const candidate = candidates.find(
+        (entry) => entry.account.id === account.id,
+      );
+      return candidate === undefined ? [] : [candidate];
+    });
+    const resetOrder = settings.selectionOrder === "reset";
+    const earliest = resetOrder ? earliestReset(ring, now) : undefined;
+    const resetsSooner = (candidate: (typeof eligible)[number]) =>
+      earliest !== undefined &&
+      resetsEarlier(
+        earliest,
+        candidate,
+        settings.resetSwitchMarginHours * HOUR_MS,
+        now,
+      );
+    const keepsActive =
+      boundAccountId === null &&
+      previousAccountId === null &&
+      activeAccount !== undefined &&
+      unattempted.includes(activeAccount);
+    const resetSwitch =
+      keepsActive && activeAccount !== undefined && resetsSooner(activeAccount);
+    const next = !resetOrder
+      ? ring[0]
+      : activeAccount !== undefined &&
+          ring.includes(activeAccount) &&
+          !resetsSooner(activeAccount)
+        ? activeAccount
+        : earliest;
     const selected =
       bound !== undefined && unattempted.includes(bound)
         ? bound
         : (inherited ??
-          (boundAccountId === null &&
-          previousAccountId === null &&
-          activeAccount !== undefined &&
-          unattempted.includes(activeAccount)
-            ? activeAccount
-            : next) ??
+          (keepsActive && !resetSwitch ? activeAccount : next) ??
           null);
     if (selected === null) return null;
     if (routing.active === null)
@@ -969,6 +992,7 @@ export class AccountPoolHub {
       !familyDetour(active.accountId) &&
       (activeAccount === undefined ||
         active.accountId === selected.account.id ||
+        (resetSwitch && selected === next) ||
         (active === routing.active && attempted.has(active.accountId)));
     return {
       ...selected,
@@ -1393,6 +1417,43 @@ export function createHub(options: {
     onAccountsChanged: options.onAccountsChanged ?? (() => {}),
     onUpstreamError: options.onUpstreamError ?? (() => {}),
   });
+}
+
+function effectiveResetAt(
+  candidate: { account: Account; quota: AccountQuota },
+  now: number,
+): number {
+  const resetAt = sharedWeeklyResetAt(candidate.quota, now);
+  return resetAt === null
+    ? Number.POSITIVE_INFINITY
+    : resetAt + candidate.account.resetOffsetHours * HOUR_MS;
+}
+
+function earliestReset<T extends { account: Account; quota: AccountQuota }>(
+  ring: readonly T[],
+  now: number,
+): T | undefined {
+  let earliest: T | undefined;
+  let earliestAt = Number.POSITIVE_INFINITY;
+  for (const candidate of ring) {
+    const resetAt = effectiveResetAt(candidate, now);
+    if (earliest === undefined || resetAt < earliestAt) {
+      earliest = candidate;
+      earliestAt = resetAt;
+    }
+  }
+  return earliest;
+}
+
+function resetsEarlier(
+  candidate: { account: Account; quota: AccountQuota },
+  current: { account: Account; quota: AccountQuota },
+  marginMs: number,
+  now: number,
+): boolean {
+  const candidateAt = effectiveResetAt(candidate, now);
+  const currentAt = effectiveResetAt(current, now);
+  return candidateAt < currentAt && candidateAt <= currentAt - marginMs;
 }
 
 function readBearer(value: string | null): string | null {

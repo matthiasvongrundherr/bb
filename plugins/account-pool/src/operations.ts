@@ -67,6 +67,7 @@ export class PoolOperations {
           rateLimitTier: null,
           enabled: true,
           priority: input.priority,
+          resetOffsetHours: 0,
         },
         { kind: "api-key", apiKey: input.source.apiKey },
       );
@@ -89,6 +90,7 @@ export class PoolOperations {
         rateLimitTier: imported.rateLimitTier,
         enabled: true,
         priority: input.priority,
+        resetOffsetHours: 0,
       },
       imported.secret,
     );
@@ -109,6 +111,7 @@ export class PoolOperations {
         rateLimitTier: authenticated.rateLimitTier,
         enabled: true,
         priority: 100,
+        resetOffsetHours: 0,
       },
       {
         kind: "oauth",
@@ -137,6 +140,7 @@ export class PoolOperations {
         rateLimitTier: null,
         enabled: true,
         priority: 100,
+        resetOffsetHours: 0,
       },
       {
         kind: "oauth",
@@ -186,6 +190,15 @@ export class PoolOperations {
 
   async setPriority(id: string, priority: number): Promise<Account | null> {
     const account = await this.accounts.setPriority(id, priority);
+    if (account !== null) this.onAccountsChanged();
+    return account;
+  }
+
+  async setResetOffset(
+    id: string,
+    resetOffsetHours: number,
+  ): Promise<Account | null> {
+    const account = await this.accounts.setResetOffset(id, resetOffsetHours);
     if (account !== null) this.onAccountsChanged();
     return account;
   }

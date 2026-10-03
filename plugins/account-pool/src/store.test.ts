@@ -31,7 +31,7 @@ function delayedAccountReads(kv: PluginKvStorage): PluginKvStorage {
 }
 
 describe("AccountStore", () => {
-  it("loads account metadata written before account UUIDs were stored", async () => {
+  it("loads account metadata written before account UUIDs and reset offsets were stored", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-store-"));
     const host = createFakePluginHost({ pluginId: "account-pool", dataDir });
     const store = new AccountStore(
@@ -58,7 +58,7 @@ describe("AccountStore", () => {
     });
 
     expect(await store.list()).toEqual([
-      expect.objectContaining({ accountUuid: null }),
+      expect.objectContaining({ accountUuid: null, resetOffsetHours: 0 }),
     ]);
   });
 
@@ -87,6 +87,7 @@ describe("AccountStore", () => {
       rateLimitTier: null,
       enabled: true,
       priority: 100,
+      resetOffsetHours: 0,
     });
 
     const [first, second] = await Promise.all([

@@ -504,6 +504,7 @@ describe("requestHeaders", () => {
         rateLimitTier: null,
         enabled: true,
         priority: 0,
+        resetOffsetHours: 0,
         createdAt: 0,
         lastUsedAt: null,
         lastUsedHostId: null,

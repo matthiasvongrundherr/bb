@@ -11,6 +11,7 @@ import {
   accountIdInputSchema,
   accountPriorityInputSchema,
   accountReorderInputSchema,
+  accountResetOffsetInputSchema,
   accountPoolConfigSetInputSchema,
   bypassInputSchema,
   codexLoginPollInputSchema,
@@ -35,6 +36,7 @@ import type { CodexDeviceLogin } from "./codex-device-login.js";
 
 const DESCRIPTION = [
   "Accounts run sequentially by priority, then order added. The current fallback stays active until unavailable.",
+  "With selectionOrder reset, new conversations go to the eligible account whose weekly limit resets first; the current account changes only when another resets at least resetSwitchMarginHours earlier.",
   "When this bb server runs inside another bb server's thread, parent proxy routes its pooled traffic through that parent; isolate neutralises the inherited routing.",
   "Reorder includes every account for the provider and changes the next failover sequence; existing conversations stay pinned.",
 ].join("\n");
@@ -124,6 +126,7 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
       "5h reset",
       "7d",
       "7d reset",
+      "Reset offset",
       "Windows",
       "Extra usage",
       ...families.map(familyLabel),
@@ -142,6 +145,7 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
         formatReset(account.fiveHourResetAt),
         formatUtilization(account.sevenDayUtilization),
         formatReset(account.sevenDayResetAt),
+        account.resetOffsetHours === 0 ? "-" : `${account.resetOffsetHours}h`,
         formatLimitWindows(account.limitWindows),
         account.extraUsage?.status ?? "-",
         ...families.map((family) =>
@@ -186,6 +190,8 @@ function formatConfig(config: AccountPoolConfig): string {
     `codexUpstreamBaseUrl: ${config.codexUpstreamBaseUrl}`,
     `switchThreshold: ${config.switchThreshold}`,
     `parentMode: ${config.parentMode}`,
+    `selectionOrder: ${config.selectionOrder}`,
+    `resetSwitchMarginHours: ${config.resetSwitchMarginHours}`,
   ].join("\n");
 }
 
@@ -223,10 +229,22 @@ function parseConfigUpdate(
   if (key === "parentMode") {
     return accountPoolConfigSetInputSchema.parse({ parentMode: value });
   }
+  if (key === "selectionOrder") {
+    return accountPoolConfigSetInputSchema.parse({ selectionOrder: value });
+  }
+  if (key === "resetSwitchMarginHours") {
+    return accountPoolConfigSetInputSchema.parse({
+      resetSwitchMarginHours: parseHours(value),
+    });
+  }
   throw new PluginCliError(
-    "Config key must be anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, or parentMode.",
+    "Config key must be anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, parentMode, selectionOrder, or resetSwitchMarginHours.",
     { code: "invalid_value" },
   );
+}
+
+function parseHours(raw: string): number {
+  return raw.trim() === "" ? Number.NaN : Number(raw);
 }
 
 function json(value: object): string {
@@ -588,6 +606,43 @@ export function registerPoolCli(
               };
             }),
         }),
+        "account reset-offset": cliCommand({
+          summary:
+            "Count an account's weekly reset later or earlier for the reset order",
+          description:
+            "With selectionOrder reset, the pool compares weekly resets plus this offset. A positive offset keeps the account behind accounts that reset at a similar time while it still runs before its own reset when that comes much earlier; 0 removes the offset.",
+          positionals: [
+            ACCOUNT_ID_POSITIONAL,
+            {
+              name: "hours",
+              description: "Hours from -168 to 168, for example 24",
+              required: true,
+            },
+          ],
+          options: { json: JSON_OPTION },
+          run: (input) =>
+            attempt(async () => {
+              const parsed = accountResetOffsetInputSchema.parse({
+                accountId: input.positionals.id,
+                resetOffsetHours: parseHours(input.positionals.hours),
+              });
+              const account = await operations.setResetOffset(
+                parsed.accountId,
+                parsed.resetOffsetHours,
+              );
+              if (account === null) {
+                throw new PluginCliError("Account not found.", {
+                  code: "account_not_found",
+                });
+              }
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? json({ ok: true, account })
+                  : `Set ${account.label} reset offset to ${account.resetOffsetHours} hours.\n`,
+              };
+            }),
+        }),
         "account reorder": cliCommand({
           summary: "Set the complete failover order for one provider",
           description:
@@ -730,13 +785,13 @@ export function registerPoolCli(
             {
               name: "key",
               description:
-                "anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, or parentMode",
+                "anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, parentMode, selectionOrder, or resetSwitchMarginHours",
               required: true,
             },
             {
               name: "value",
               description:
-                "HTTP(S) URL for the upstream keys, a number above 0 and at most 1 for switchThreshold, proxy or isolate for parentMode",
+                "HTTP(S) URL for the upstream keys, a number above 0 and at most 1 for switchThreshold, proxy or isolate for parentMode, priority or reset for selectionOrder, hours from 0 to 168 for resetSwitchMarginHours",
               required: true,
             },
           ],

@@ -120,6 +120,13 @@ export class AccountStore {
     return this.update(id, (account) => ({ ...account, priority }));
   }
 
+  async setResetOffset(
+    id: string,
+    resetOffsetHours: number,
+  ): Promise<Account | null> {
+    return this.update(id, (account) => ({ ...account, resetOffsetHours }));
+  }
+
   async setSubscriptionType(
     id: string,
     subscriptionType: string,

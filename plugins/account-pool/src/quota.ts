@@ -297,6 +297,21 @@ export function isQuotaRejection(headers: Headers): boolean {
   return false;
 }
 
+const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+
+export function sharedWeeklyResetAt(
+  quota: AccountQuota,
+  now: number,
+): number | null {
+  const resetAt =
+    quota.sevenDayResetAt ??
+    quota.limitWindows.find(
+      (window) => window.windowMinutes === WEEKLY_WINDOW_MINUTES,
+    )?.resetAt ??
+    null;
+  return resetAt !== null && resetAt > now ? resetAt : null;
+}
+
 export function governingWeeklyResetAt(
   quota: AccountQuota,
   family: ModelFamily,

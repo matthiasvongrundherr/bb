@@ -354,13 +354,23 @@ const EMPTY_USAGE_URL = "data:application/json,{}";
 const CODEX_USAGE_STUB_URL = "https://usage.example/wham/usage";
 
 describe("Account Pool config schema", () => {
-  it("fills defaults and rejects invalid URLs and thresholds", () => {
+  it("fills defaults and rejects invalid URLs, thresholds, selection orders, and margins", () => {
     expect(accountPoolConfigSchema.parse({})).toEqual({
       anthropicUpstreamBaseUrl: "https://api.anthropic.com",
       codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
       switchThreshold: 0.98,
       parentMode: "proxy",
+      selectionOrder: "priority",
+      resetSwitchMarginHours: 12,
     });
+    expect(
+      accountPoolConfigSetInputSchema.safeParse({ selectionOrder: "random" })
+        .success,
+    ).toBe(false);
+    expect(
+      accountPoolConfigSetInputSchema.safeParse({ resetSwitchMarginHours: -1 })
+        .success,
+    ).toBe(false);
     expect(
       accountPoolConfigSetInputSchema.safeParse({
         anthropicUpstreamBaseUrl: "ftp://example.com",
@@ -450,6 +460,37 @@ describe("Account Pool plugin", () => {
     ]);
     expect(cliSet.exitCode).toBe(0);
     expect(cliSet.stdout).toContain("switchThreshold: 0.75");
+    expect(cliSet.stdout).toContain("selectionOrder: priority");
+    expect(cliSet.stdout).toContain("resetSwitchMarginHours: 12");
+    const orderSet = await host.harness.behavior.runCli([
+      "config",
+      "set",
+      "selectionOrder",
+      "reset",
+    ]);
+    expect(orderSet.exitCode).toBe(0);
+    expect(orderSet.stdout).toContain("selectionOrder: reset");
+    const marginSet = await host.harness.behavior.runCli([
+      "config",
+      "set",
+      "resetSwitchMarginHours",
+      "6",
+    ]);
+    expect(marginSet.exitCode).toBe(0);
+    expect(marginSet.stdout).toContain("resetSwitchMarginHours: 6");
+    for (const [key, value] of [
+      ["selectionOrder", "random"],
+      ["resetSwitchMarginHours", ""],
+      ["resetSwitchMarginHours", "200"],
+    ]) {
+      const rejected = await host.harness.behavior.runCli([
+        "config",
+        "set",
+        key,
+        value,
+      ]);
+      expect(rejected.exitCode).toBe(1);
+    }
     const updated = accountPoolConfigSchema.parse(
       await host.harness.behavior.callRpc("config.set", {
         anthropicUpstreamBaseUrl: "http://127.0.0.1:9000",
@@ -460,6 +501,8 @@ describe("Account Pool plugin", () => {
       codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
       switchThreshold: 0.75,
       parentMode: "proxy",
+      selectionOrder: "reset",
+      resetSwitchMarginHours: 6,
     });
     expect(
       accountPoolConfigSchema.parse(await host.bb.storage.kv.get("config")),
@@ -6584,6 +6627,334 @@ describe("sequential pool recovery", () => {
           await fixture.host.harness.behavior.callRpc("account.list", null),
         )[0]?.id,
     ).toBe(second.id);
+  });
+});
+
+describe("reset-ordered account selection", () => {
+  const CLAUDE_USAGE = "https://usage.example/claude";
+  const CODEX_USAGE = "https://usage.example/codex";
+  const HOUR_MS = 60 * 60 * 1_000;
+  const DAY_MS = 24 * HOUR_MS;
+  const NOW = 1_800_000_000_000;
+
+  function credential(init: RequestInit | undefined): string {
+    const headers = new Headers(init?.headers);
+    return (
+      headers.get("x-api-key") ??
+      headers.get("authorization")?.replace(/^Bearer /u, "") ??
+      ""
+    );
+  }
+
+  function usage(
+    provider: "claude" | "codex",
+    weeklyResetAt: number | null,
+  ): object {
+    if (provider === "claude")
+      return {
+        seven_day: {
+          utilization: 10,
+          resets_at:
+            weeklyResetAt === null
+              ? null
+              : new Date(weeklyResetAt).toISOString(),
+        },
+      };
+    return {
+      rate_limit: {
+        primary_window: {
+          used_percent: 5,
+          reset_after_seconds: 3_600,
+          limit_window_seconds: 18_000,
+        },
+        secondary_window:
+          weeklyResetAt === null
+            ? null
+            : {
+                used_percent: 10,
+                reset_at: weeklyResetAt / 1_000,
+                limit_window_seconds: 604_800,
+              },
+      },
+    };
+  }
+
+  function exhaustedResponse(provider: "claude" | "codex", now: number) {
+    return Response.json(
+      {},
+      {
+        status: 429,
+        headers:
+          provider === "claude"
+            ? {
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-reset": String(
+                  now / 1_000 + 3_600,
+                ),
+              }
+            : {
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-primary-reset-after-seconds": "3600",
+              },
+      },
+    );
+  }
+
+  async function resetFixture(
+    provider: "claude" | "codex",
+    weeklyResets: ReadonlyArray<number | null>,
+  ) {
+    const now = () => NOW;
+    const tokens = weeklyResets.map((_reset, index) => `sk-${index}`);
+    const resetByToken = new Map(
+      tokens.map((token, index) => [token, weeklyResets[index] ?? null]),
+    );
+    const exhausted = new Set<string>();
+    const seen: string[] = [];
+    let imported = 0;
+    const nextToken = () => {
+      const token = tokens[imported] ?? "sk-extra";
+      imported += 1;
+      return token;
+    };
+    const fixture = await createFixture({
+      upstreamUrl: "https://upstream.example",
+      provider,
+      source: "import",
+      options: {
+        now,
+        usageUrl: CLAUDE_USAGE,
+        codexUsageUrl: CODEX_USAGE,
+        fetch: async (input, init) => {
+          const token = credential(init);
+          if (String(input) === CLAUDE_USAGE || String(input) === CODEX_USAGE)
+            return Response.json(
+              usage(provider, resetByToken.get(token) ?? null),
+            );
+          seen.push(token);
+          return exhausted.has(token)
+            ? exhaustedResponse(provider, now())
+            : Response.json({});
+        },
+        importCredentials: async () => {
+          const token = nextToken();
+          return importedCredentials({
+            accessToken: token,
+            email: `${token}@example.com`,
+            accountUuid: `00000000-0000-4000-8000-00000000000${imported}`,
+            expiresAt: now() + DAY_MS,
+          });
+        },
+        importCodexCredentials: async () => {
+          const token = nextToken();
+          return {
+            accessToken: token,
+            refreshToken: "refresh",
+            idToken: null,
+            accountId: `codex-account-${token}`,
+            email: `${token}@example.com`,
+            expiresAt: now() + DAY_MS,
+          };
+        },
+      },
+    });
+    for (let index = 1; index < tokens.length; index += 1) {
+      await fixture.host.harness.behavior.callRpc("account.add", {
+        provider,
+        source: { kind: "import" },
+        label: null,
+        priority: 100,
+      });
+    }
+    const send = async (session: string) => {
+      const response = await fixture.host.harness.behavior.fetchHttp(
+        "POST",
+        provider === "claude" ? "/v1/messages" : "/v1/responses",
+        {
+          headers: {
+            ...authHeaders(fixture.key),
+            ...(provider === "codex" ? { "session-id": session } : {}),
+          },
+          body:
+            provider === "claude"
+              ? JSON.stringify({
+                  metadata: {
+                    user_id: JSON.stringify({ session_id: session }),
+                  },
+                })
+              : "{}",
+        },
+      );
+      expect(response.status).toBe(200);
+      await response.text();
+    };
+    const cli = async (args: string[]) => {
+      const result = await fixture.host.harness.behavior.runCli(args);
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    const setOrder = (order: "priority" | "reset") =>
+      cli(["config", "set", "selectionOrder", order]);
+    const setMargin = (hours: number) =>
+      cli(["config", "set", "resetSwitchMarginHours", String(hours)]);
+    const accountId = async (token: string) => {
+      const list = z
+        .array(accountSummarySchema)
+        .parse(
+          await fixture.host.harness.behavior.callRpc("account.list", null),
+        );
+      const found = list.find(
+        (account) => account.email === `${token}@example.com`,
+      );
+      if (found === undefined) throw new Error(`No account for ${token}.`);
+      return found.id;
+    };
+    const setOffset = async (token: string, hours: number) =>
+      cli(["account", "reset-offset", await accountId(token), String(hours)]);
+    return {
+      fixture,
+      exhausted,
+      seen,
+      send,
+      setOrder,
+      setMargin,
+      setOffset,
+      accountId,
+    };
+  }
+
+  it.each([
+    ["claude", "priority", ["sk-0", "sk-0", "sk-1", "sk-1", "sk-2"]],
+    ["claude", "reset", ["sk-2", "sk-2", "sk-1", "sk-1", "sk-0"]],
+    ["codex", "priority", ["sk-0", "sk-0", "sk-1", "sk-1", "sk-2"]],
+    ["codex", "reset", ["sk-2", "sk-2", "sk-1", "sk-1", "sk-0"]],
+  ] as const)(
+    "fails %s accounts over in %s order",
+    async (provider, order, expected) => {
+      const pool = await resetFixture(provider, [
+        NOW + 5 * DAY_MS,
+        NOW + 3 * DAY_MS,
+        NOW + DAY_MS,
+      ]);
+      await pool.setOrder(order);
+      await pool.send("one");
+      pool.exhausted.add(expected[0]);
+      await pool.send("two");
+      pool.exhausted.add(expected[2]);
+      await pool.send("three");
+      expect(pool.seen).toEqual(expected);
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "puts unknown or past %s weekly resets last and breaks ties by priority order",
+    async (provider) => {
+      const pool = await resetFixture(provider, [
+        NOW - HOUR_MS,
+        NOW + 2 * DAY_MS,
+        NOW + 2 * DAY_MS,
+        null,
+      ]);
+      await pool.setOrder("reset");
+      await pool.send("one");
+      pool.exhausted.add("sk-1");
+      await pool.send("two");
+      pool.exhausted.add("sk-2");
+      await pool.send("three");
+      expect(pool.seen).toEqual(["sk-1", "sk-1", "sk-2", "sk-2", "sk-3"]);
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "moves new %s conversations to an account that resets far earlier and keeps pinned ones",
+    async (provider) => {
+      const pool = await resetFixture(provider, [
+        NOW + 5 * DAY_MS,
+        NOW + DAY_MS,
+      ]);
+      await pool.send("pinned");
+      await pool.setOrder("reset");
+      await pool.send("pinned");
+      await pool.send("fresh");
+      await pool.send("another");
+      await pool.send("pinned");
+      expect(pool.seen).toEqual(["sk-0", "sk-0", "sk-1", "sk-1", "sk-0"]);
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "keeps the active %s account until another resets at least the margin earlier",
+    async (provider) => {
+      const pool = await resetFixture(provider, [
+        NOW + 3 * DAY_MS,
+        NOW + 3 * DAY_MS - 6 * HOUR_MS,
+      ]);
+      await pool.send("first");
+      await pool.setOrder("reset");
+      await pool.send("second");
+      await pool.setMargin(4);
+      await pool.send("third");
+      await pool.send("first");
+      await pool.send("fourth");
+      expect(pool.seen).toEqual(["sk-0", "sk-0", "sk-1", "sk-0", "sk-1"]);
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "counts a %s reset offset so the account trails similar resets",
+    async (provider) => {
+      const pool = await resetFixture(provider, [
+        NOW + 7 * DAY_MS,
+        NOW + 7 * DAY_MS,
+        NOW + 7 * DAY_MS,
+      ]);
+      await pool.send("first");
+      await pool.setOrder("reset");
+      await pool.send("second");
+      expect(await pool.setOffset("sk-0", 24)).toContain(
+        "reset offset to 24 hours",
+      );
+      await pool.send("third");
+      await pool.send("first");
+      expect(pool.seen).toEqual(["sk-0", "sk-0", "sk-1", "sk-0"]);
+      const list = await pool.fixture.host.harness.behavior.runCli([
+        "account",
+        "list",
+      ]);
+      expect(list.stdout).toContain("\t24h\t");
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "still drains an offset %s account before a much earlier reset",
+    async (provider) => {
+      const pool = await resetFixture(provider, [
+        NOW + 3 * DAY_MS,
+        NOW + 12 * HOUR_MS,
+      ]);
+      await pool.send("first");
+      await pool.setOrder("reset");
+      await pool.setOffset("sk-1", 24);
+      await pool.send("second");
+      await pool.setOffset("sk-1", 96);
+      await pool.send("third");
+      expect(pool.seen).toEqual(["sk-0", "sk-1", "sk-0"]);
+    },
+  );
+
+  it("rejects reset offsets outside one week", async () => {
+    const pool = await resetFixture("claude", [NOW + DAY_MS]);
+    const id = await pool.accountId("sk-0");
+    for (const value of ["169", "-169", "", "soon"]) {
+      const result = await pool.fixture.host.harness.behavior.runCli([
+        "account",
+        "reset-offset",
+        id,
+        value,
+      ]);
+      expect(result.exitCode).toBe(1);
+    }
   });
 });
 

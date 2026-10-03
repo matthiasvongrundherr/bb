@@ -70,6 +70,7 @@ function summary(account: CodexDeviceAccount): AccountSummary {
     rateLimitTier: null,
     enabled: true,
     priority: 100,
+    resetOffsetHours: 0,
     createdAt: 1,
     lastUsedAt: null,
     lastUsedHostId: null,

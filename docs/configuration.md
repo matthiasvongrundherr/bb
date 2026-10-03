@@ -1200,6 +1200,23 @@ family without moving the session's main pin or the provider cursor. The cursor
 and session pins survive hub restarts. Session pins expire after 30 idle minutes,
 and the pool retains the 4,096 most recently used pins.
 
+With `bb pool config set selectionOrder reset`, accounts are ordered by their
+shared weekly reset (Claude's seven-day window, Codex's weekly limit window)
+instead of the priority ring. New conversations go to the eligible account whose
+weekly limit resets first, so budget that expires first is used first. The
+current account changes only when another eligible account resets at least
+`resetSwitchMarginHours` earlier (default 12), which keeps caches warm and avoids
+switching between close resets; once the current account is exhausted or fails,
+the pool takes the eligible account that resets first. Session pins behave as
+with the default `priority`. Unknown or past weekly resets sort last, and ties
+keep the priority order from the current account onward.
+`bb pool account reset-offset <id> <hours>` counts one account's reset that many
+hours later (negative values: earlier) for this comparison only, for example to
+drain a subscription that also powers another tool late in its week but still
+before its reset; `0` removes the offset. Account tables show it in a Reset
+offset column; JSON and the `account.setResetOffset` plugin RPC use
+`resetOffsetHours`.
+
 Use the up/down arrows in Account Pooler settings, or
 `bb pool account reorder <claude|codex> <id>...`, to set the complete order for
 one provider. Include disabled accounts too. Reordering changes the next failover
@@ -1207,9 +1224,12 @@ sequence without moving the current account. `bb pool account priority <id> <n>`
 sets an individual priority; the same operations are available through the
 `account.reorder` and `account.setPriority` plugin RPCs.
 
-Three plugin-owned configuration values control routing. `switchThreshold` is
+Five plugin-owned configuration values control routing. `switchThreshold` is
 the shared or requested model-family quota fraction at which an account stops
-receiving matching traffic and defaults to `0.98`.
+receiving matching traffic and defaults to `0.98`. `selectionOrder` defaults to
+`priority`; `reset` sends new conversations to the eligible account whose weekly
+limit resets first, and `resetSwitchMarginHours` (default `12`, 0 to 168) is how
+much earlier another account must reset before the current account changes.
 `anthropicUpstreamBaseUrl` defaults to `https://api.anthropic.com` and
 `codexUpstreamBaseUrl` defaults to
 `https://chatgpt.com/backend-api/codex`. Codex uses the hub's HTTP Responses
@@ -1220,6 +1240,9 @@ with a controlled fake upstream. Inspect or update the full plugin KV-backed con
 ```sh
 bb pool config
 bb pool config set switchThreshold 0.98
+bb pool config set selectionOrder reset
+bb pool config set resetSwitchMarginHours 12
+bb pool account reset-offset <id> 24
 bb pool config set anthropicUpstreamBaseUrl http://127.0.0.1:9000
 bb pool config set codexUpstreamBaseUrl http://127.0.0.1:9001
 ```

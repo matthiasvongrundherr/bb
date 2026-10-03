@@ -16,12 +16,13 @@ bb pool account remove <id>
 bb pool account enable <id>
 bb pool account disable <id>
 bb pool account priority <id> <n>
+bb pool account reset-offset <id> <hours>
 bb pool account reorder <claude|codex> <id>...
 bb pool account refresh <id>
 bb pool status [--json]
 bb pool routing <claude|codex> [--off]
 bb pool config
-bb pool config set <anthropicUpstreamBaseUrl|codexUpstreamBaseUrl|switchThreshold|parentMode> <value>
+bb pool config set <anthropicUpstreamBaseUrl|codexUpstreamBaseUrl|switchThreshold|parentMode|selectionOrder|resetSwitchMarginHours> <value>
 bb pool parent [proxy|isolate]
 bb pool token rotate --machine <id-or-name>
 bb pool bypass <thread-id> [--off]
@@ -75,7 +76,9 @@ while retaining it for other families. A present `metadata.user_id` account
 UUID is aligned with the selected OAuth account. Use `bb pool config` to
 inspect the full routing configuration and
 `bb pool config set <key> <value>` to update one value. The upstream URL keys
-are QA-only overrides; `switchThreshold` must be greater than 0 and at most 1.
+are QA-only overrides; `switchThreshold` must be greater than 0 and at most 1;
+`selectionOrder` is `priority` (default) or `reset`; `resetSwitchMarginHours`
+is 0 to 168 hours and reset offsets are -168 to 168 hours.
 
 Accounts run sequentially per provider: lower priority numbers first, with ties
 following the order accounts were added. New conversations use the current
@@ -88,6 +91,23 @@ conversations can advance. A model-family limit detours only requests for that
 family without moving the session's main pin or the provider cursor. The cursor
 and session pins survive hub restarts. Session pins expire after 30 idle minutes,
 and the pool retains the 4,096 most recently used pins.
+
+With `bb pool config set selectionOrder reset`, accounts are ordered by their
+shared weekly reset (Claude's seven-day window, Codex's weekly limit window)
+instead of the priority ring. New conversations go to the eligible account whose
+weekly limit resets first, so budget that expires first is used first. The
+current account changes only when another eligible account resets at least
+`resetSwitchMarginHours` earlier (default 12), which keeps caches warm and avoids
+switching between close resets; once the current account is exhausted or fails,
+the pool takes the eligible account that resets first. Session pins behave as
+with the default `priority`. Unknown or past weekly resets sort last, and ties
+keep the priority order from the current account onward.
+`bb pool account reset-offset <id> <hours>` counts one account's reset that many
+hours later (negative values: earlier) for this comparison only, for example to
+drain a subscription that also powers another tool late in its week but still
+before its reset; `0` removes the offset. Account tables show it in a Reset
+offset column; JSON and the `account.setResetOffset` plugin RPC use
+`resetOffsetHours`.
 
 Claude accounts with an exhausted subscription window remain eligible as a
 fallback when Anthropic reports extra usage enabled with remaining allowance,
