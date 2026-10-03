@@ -17,6 +17,8 @@ bb pool account enable <id>
 bb pool account disable <id>
 bb pool account priority <id> <n>
 bb pool account reorder <claude|codex> <id>...
+bb pool account last-resort <id> [--off]
+bb pool account threshold <id> <value>|--clear
 bb pool account refresh <id>
 bb pool status [--json]
 bb pool routing <claude|codex> [--off]
@@ -114,6 +116,28 @@ clear the matching restriction. JSON account/status responses expose
 `usageRestriction` (reason and optional reset time); the pool does not change
 workspace spending controls or purchase credits. Availability is not current
 billing activity.
+
+Last-resort accounts take traffic only while no regular account of the same
+provider is eligible for the request. While one is, new conversations skip
+them, and a conversation pinned to a last-resort account or a provider cursor
+on one moves to the next regular account with its next request. When no
+regular account is eligible, last-resort accounts run in their usual priority
+order. API-key accounts start as last resort, including API keys added before
+this setting existed; OAuth accounts start as regular. Change it with
+`bb pool account last-resort <id>` (`--off` makes the account regular again),
+the account menu in settings, or the `account.setLastResort` plugin RPC.
+`bb pool account threshold <id> <value>` gives one account its own switch
+threshold, used instead of `switchThreshold` for every quota window of that
+account, for example `0.7` to leave 30 percent of a subscription for another
+tool; `--clear` returns the account to the pool-wide value, and the plugin RPC
+is `account.setSwitchThreshold`. Account JSON reports both as `lastResort` and
+`switchThreshold` (`null` uses the pool-wide value).
+
+`bb pool status` names each provider's active account, the account that new
+conversations start on while it is eligible, and `status --json` reports it as
+`activeAccounts.claude` and `activeAccounts.codex` (`null` until the pool has
+routed a request for that provider). `bb pool account list` marks it in the
+Active column and with `active: true` in JSON.
 
 Drag an account’s handle in Account Pooler settings (or focus the handle and use
 Space, arrow keys, and Space again), or

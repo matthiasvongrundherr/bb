@@ -9,9 +9,11 @@ import { setTimeout as wait } from "node:timers/promises";
 import {
   accountAddInputSchema,
   accountIdInputSchema,
+  accountLastResortInputSchema,
   accountPriorityInputSchema,
   accountReorderInputSchema,
   accountPoolConfigSetInputSchema,
+  accountSwitchThresholdInputSchema,
   bypassInputSchema,
   codexLoginPollInputSchema,
   loginCompleteInputSchema,
@@ -26,6 +28,7 @@ import {
   type FamilyQuota,
   type LimitWindow,
   type ModelFamily,
+  type PoolProvider,
   type PoolStatus,
   type PoolStatusReport,
 } from "./contracts.js";
@@ -35,6 +38,7 @@ import type { CodexDeviceLogin } from "./codex-device-login.js";
 
 const DESCRIPTION = [
   "Accounts run sequentially by priority, then order added. The current fallback stays active until unavailable.",
+  "Last-resort accounts take traffic only while no regular account of the same provider is eligible; API keys start as last resort.",
   "When this bb server runs inside another bb server's thread, parent proxy routes its pooled traffic through that parent; isolate neutralises the inherited routing.",
   "Reorder includes every account for the provider and changes the next failover sequence; existing conversations stay pinned.",
 ].join("\n");
@@ -120,6 +124,9 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
       "Kind",
       "Enabled",
       "Priority",
+      "Active",
+      "Last resort",
+      "Threshold",
       "5h",
       "5h reset",
       "7d",
@@ -138,6 +145,11 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
         account.kind,
         String(account.enabled),
         String(account.priority),
+        String(account.active),
+        String(account.lastResort),
+        account.switchThreshold === null
+          ? "-"
+          : String(account.switchThreshold),
         formatUtilization(account.fiveHourUtilization),
         formatReset(account.fiveHourResetAt),
         formatUtilization(account.sevenDayUtilization),
@@ -153,12 +165,25 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
   ].join("\n");
 }
 
+function formatActiveAccount(
+  status: PoolStatus,
+  provider: PoolProvider,
+): string {
+  const accountId = status.activeAccounts[provider];
+  const account = status.accounts.find(
+    (candidate) => candidate.id === accountId,
+  );
+  return account === undefined ? "none" : `${account.label} (${account.id})`;
+}
+
 function formatStatus(status: PoolStatusReport): string {
   return [
     `Route: ${status.route}`,
     `Accepting: ${status.accepting}`,
     `Enabled accounts: ${status.enabledAccountCount}`,
     `In flight: ${status.inFlight}`,
+    `Active Claude account: ${formatActiveAccount(status, "claude")}`,
+    `Active Codex account: ${formatActiveAccount(status, "codex")}`,
     "",
     "Machine tokens:",
     ...(status.hosts.length === 0
@@ -227,6 +252,17 @@ function parseConfigUpdate(
     "Config key must be anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, or parentMode.",
     { code: "invalid_value" },
   );
+}
+
+function parseSwitchThreshold(raw: string): number {
+  const value = Number(raw);
+  if (raw.trim() === "" || !Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new PluginCliError(
+      `invalid value '${raw}' for <value>. Expected a number above 0 and at most 1`,
+      { code: "invalid_value" },
+    );
+  }
+  return value;
 }
 
 function json(value: object): string {
@@ -588,6 +624,102 @@ export function registerPoolCli(
               };
             }),
         }),
+        "account last-resort": cliCommand({
+          summary:
+            "Use an account only while no regular account of its provider is eligible",
+          description:
+            "While a regular account of the same provider can take a request, a last-resort account gets no new conversations, and conversations and the provider's active account on it move back to a regular account. When no regular account is eligible, last-resort accounts run in priority order. API-key accounts start as last resort; --off makes the account a regular pool member.",
+          positionals: [ACCOUNT_ID_POSITIONAL],
+          options: {
+            off: {
+              type: "boolean",
+              aliases: ["disable"],
+              description: "Make the account a regular pool member again",
+            },
+            json: JSON_OPTION,
+          },
+          run: (input) =>
+            attempt(async () => {
+              const parsed = accountLastResortInputSchema.parse({
+                accountId: input.positionals.id,
+                lastResort: !input.options.off,
+              });
+              const account = await operations.setLastResort(
+                parsed.accountId,
+                parsed.lastResort,
+              );
+              if (account === null) {
+                throw new PluginCliError("Account not found.", {
+                  code: "account_not_found",
+                });
+              }
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? json({ ok: true, account })
+                  : `${account.label} is now a ${account.lastResort ? "last-resort" : "regular"} account.\n`,
+              };
+            }),
+        }),
+        "account threshold": cliCommand({
+          summary: "Set or clear an account's own quota switch threshold",
+          description:
+            "The account stops receiving matching traffic once one of its quota windows reaches this fraction, instead of the pool-wide switchThreshold. --clear returns the account to the pool-wide value.",
+          aliases: ["account switch-threshold"],
+          positionals: [
+            ACCOUNT_ID_POSITIONAL,
+            {
+              name: "value",
+              description: "Number above 0 and at most 1, for example 0.7",
+            },
+          ],
+          options: {
+            clear: {
+              type: "boolean",
+              aliases: ["unset"],
+              description: "Use the pool-wide switchThreshold again",
+            },
+            json: JSON_OPTION,
+          },
+          run: (input) =>
+            attempt(async () => {
+              const raw = input.positionals.value;
+              if (raw === undefined && !input.options.clear) {
+                throw new PluginCliError(
+                  "missing required arguments: <value> or --clear",
+                  { code: "missing_required" },
+                );
+              }
+              if (raw !== undefined && input.options.clear) {
+                throw new PluginCliError(
+                  "Pass either <value> or --clear, not both.",
+                  { code: "invalid_value" },
+                );
+              }
+              const parsed = accountSwitchThresholdInputSchema.parse({
+                accountId: input.positionals.id,
+                switchThreshold:
+                  raw === undefined ? null : parseSwitchThreshold(raw),
+              });
+              const account = await operations.setSwitchThreshold(
+                parsed.accountId,
+                parsed.switchThreshold,
+              );
+              if (account === null) {
+                throw new PluginCliError("Account not found.", {
+                  code: "account_not_found",
+                });
+              }
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? json({ ok: true, account })
+                  : account.switchThreshold === null
+                    ? `${account.label} uses the pool-wide switch threshold.\n`
+                    : `Set ${account.label} switch threshold to ${account.switchThreshold}.\n`,
+              };
+            }),
+        }),
         "account reorder": cliCommand({
           summary: "Set the complete failover order for one provider",
           description:
@@ -652,7 +784,8 @@ export function registerPoolCli(
             }),
         }),
         status: cliCommand({
-          summary: "Show hub, machine token, routing, and account status",
+          summary:
+            "Show hub, machine token, routing, active account, and account status",
           suggestFor: ["info", "hub"],
           options: { json: JSON_OPTION },
           run: (input) =>

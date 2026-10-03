@@ -60,6 +60,8 @@ function account(overrides: Partial<AccountSummary> = {}): AccountSummary {
     rateLimitTier: "default_claude_max_5x",
     enabled: true,
     priority: 100,
+    lastResort: false,
+    switchThreshold: null,
     createdAt: 1,
     lastUsedAt: 2,
     lastUsedHostId: "host-one",
@@ -85,6 +87,7 @@ function account(overrides: Partial<AccountSummary> = {}): AccountSummary {
     heldUntil: null,
     error: null,
     inFlight: 0,
+    active: false,
     status: "ready",
     ...overrides,
   };
@@ -99,6 +102,7 @@ function status(accounts: AccountSummary[] = [account()]): PoolStatus {
     hosts: [
       { hostId: "host-one", hostName: "bee", mintedAt: 1, lastUsedAt: 2 },
     ],
+    activeAccounts: { claude: null, codex: null },
     accounts,
     routing: { claude: true, codex: true },
     parent: null,
@@ -333,6 +337,11 @@ describe("Account Pool settings", () => {
       method: "account.refreshUsage",
       input: { accountId: account().id },
     },
+    {
+      action: "Use as last resort",
+      method: "account.setLastResort",
+      input: { accountId: account().id, lastResort: true },
+    },
   ])(
     "dispatches $action to its RPC contract",
     async ({ action, method, input }) => {
@@ -346,6 +355,93 @@ describe("Account Pool settings", () => {
       expect(slot.rpcCalls).toContainEqual({ method, input });
     },
   );
+
+  it("marks the active account and last-resort accounts", async () => {
+    const slot = render([
+      account({ label: "Subscription", active: true }),
+      account({
+        id: "22222222-2222-4222-8222-222222222222",
+        kind: "api-key",
+        label: "Claude API key",
+        email: null,
+        subscriptionType: null,
+        lastResort: true,
+      }),
+    ]);
+    const badges = (label: string) =>
+      Array.from(
+        slot
+          .getByRole("button", { name: `Open ${label}` })
+          .querySelectorAll("span.shrink-0.rounded-sm"),
+      ).map((badge) => badge.textContent);
+    expect(await slot.findByText("Subscription")).toBeTruthy();
+    expect(badges("Subscription")).toEqual(["Max", "Active"]);
+    expect(badges("Claude API key")).toEqual(["API key", "Last resort"]);
+    fireEvent.pointerDown(
+      slot.getByRole("button", { name: "Claude API key actions" }),
+    );
+    expect(await slot.findByText("Use as regular account")).toBeTruthy();
+  });
+
+  it("sets and clears an account's own switch threshold", async () => {
+    const slot = render([account({ switchThreshold: 0.7 })], {
+      "account.setSwitchThreshold": () => ({ account: null }),
+    });
+    const openDialog = async () => {
+      fireEvent.pointerDown(
+        await slot.findByRole("button", { name: "person@example.com actions" }),
+      );
+      fireEvent.click(await slot.findByText("Set switch threshold…"));
+      const input = await slot.findByLabelText("Account switch threshold");
+      if (!(input instanceof HTMLInputElement))
+        throw new Error("Expected the threshold field to be an input.");
+      return input;
+    };
+    const input = await openDialog();
+    expect(input.value).toBe("0.7");
+    fireEvent.change(input, { target: { value: "1.5" } });
+    expect(
+      slot.getByRole("button", { name: "Save" }).hasAttribute("disabled"),
+    ).toBe(true);
+    fireEvent.change(input, { target: { value: "0.6" } });
+    fireEvent.click(slot.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "account.setSwitchThreshold",
+        input: { accountId: account().id, switchThreshold: 0.6 },
+      }),
+    );
+    await waitFor(() =>
+      expect(slot.queryByLabelText("Account switch threshold")).toBeNull(),
+    );
+    await openDialog();
+    fireEvent.click(slot.getByRole("button", { name: "Use pool default" }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "account.setSwitchThreshold",
+        input: { accountId: account().id, switchThreshold: null },
+      }),
+    );
+  });
+
+  it("shows an account's own switch threshold and routing role in its details", async () => {
+    const slot = render([
+      account({ switchThreshold: 0.7, lastResort: true, active: true }),
+    ]);
+    fireEvent.click(
+      await slot.findByRole("button", {
+        name: "Open person@example.com details",
+      }),
+    );
+    expect(await slot.findByText("70% · this account")).toBeTruthy();
+    expect(
+      slot.getByText("Last resort: only while no regular account is eligible"),
+    ).toBeTruthy();
+    expect(slot.getAllByText(/will be skipped at 70%/).length).toBeGreaterThan(
+      0,
+    );
+    expect(slot.queryByText(/will be skipped at 98%/)).toBeNull();
+  });
 
   it("confirms Remove before dispatching its RPC contract", async () => {
     const slot = render([account()], {

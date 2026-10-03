@@ -143,6 +143,13 @@ export function quotaFromHeaders(
   };
 }
 
+export function effectiveSwitchThreshold(
+  account: Pick<Account, "switchThreshold">,
+  poolThreshold: number,
+): number {
+  return account.switchThreshold ?? poolThreshold;
+}
+
 function activeWindow(
   utilization: number | null,
   status: string | null,

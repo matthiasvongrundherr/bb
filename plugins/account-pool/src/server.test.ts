@@ -6587,6 +6587,465 @@ describe("sequential pool recovery", () => {
   });
 });
 
+describe("last-resort accounts and account thresholds", () => {
+  const sessionBody = (session: string) =>
+    JSON.stringify({
+      metadata: { user_id: JSON.stringify({ session_id: session }) },
+    });
+  const cliAccountSchema = z
+    .object({ ok: z.literal(true), account: accountSchema })
+    .strict();
+
+  function credential(init: RequestInit | undefined): string {
+    const headers = new Headers(init?.headers);
+    return (
+      headers.get("x-api-key") ??
+      headers.get("authorization")?.replace(/^Bearer /u, "") ??
+      ""
+    );
+  }
+
+  function exhaustedResponse(
+    provider: "claude" | "codex",
+    resetAt: number,
+    now: number,
+  ): Response {
+    return Response.json(
+      {},
+      {
+        status: 429,
+        headers:
+          provider === "claude"
+            ? {
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-reset": String(resetAt / 1_000),
+              }
+            : {
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-primary-reset-after-seconds": String(
+                  (resetAt - now) / 1_000,
+                ),
+              },
+      },
+    );
+  }
+
+  async function poolFixture(
+    provider: "claude" | "codex",
+    keys: readonly string[],
+    upstreamFetch: typeof fetch,
+    now: () => number,
+  ): Promise<{ fixture: Fixture; ids: string[] }> {
+    let imported = 0;
+    const fixture = await createFixture({
+      upstreamUrl: "https://upstream.example",
+      provider,
+      source: provider === "codex" ? "import" : "api-key",
+      apiKey: keys[0],
+      options: {
+        now,
+        codexUsageUrl: EMPTY_USAGE_URL,
+        fetch: (input, init) =>
+          String(input) === EMPTY_USAGE_URL
+            ? Promise.resolve(Response.json({}))
+            : upstreamFetch(input, init),
+        importCodexCredentials: async () => {
+          const accessToken = keys[imported] ?? "sk-extra";
+          imported += 1;
+          return {
+            accessToken,
+            refreshToken: "refresh",
+            idToken: null,
+            accountId: `codex-account-${accessToken}`,
+            email: null,
+            expiresAt: now() + 24 * 60 * 60 * 1_000,
+          };
+        },
+      },
+    });
+    const ids = [fixture.account.id];
+    for (const key of keys.slice(1)) {
+      if (provider === "claude") {
+        ids.push((await addApiAccount(fixture, key)).id);
+      } else {
+        ids.push(
+          accountSchema.parse(
+            await fixture.host.harness.behavior.callRpc("account.add", {
+              provider,
+              source: { kind: "import" },
+              label: null,
+              priority: 100,
+            }),
+          ).id,
+        );
+      }
+    }
+    return { fixture, ids };
+  }
+
+  async function setLastResort(
+    fixture: Fixture,
+    accountId: string,
+    lastResort: boolean,
+  ) {
+    const result = await fixture.host.harness.behavior.runCli([
+      "account",
+      "last-resort",
+      accountId,
+      ...(lastResort ? [] : ["--off"]),
+      "--json",
+    ]);
+    expect(result.exitCode, result.stderr).toBe(0);
+    const { account } = cliAccountSchema.parse(JSON.parse(result.stdout));
+    expect(account.lastResort).toBe(lastResort);
+    return account;
+  }
+
+  async function sendTo(
+    fixture: Fixture,
+    provider: "claude" | "codex",
+    session: string,
+  ): Promise<void> {
+    const response = await fixture.host.harness.behavior.fetchHttp(
+      "POST",
+      provider === "claude" ? "/v1/messages" : "/v1/responses",
+      {
+        headers: {
+          ...authHeaders(fixture.key),
+          ...(provider === "codex" ? { "session-id": session } : {}),
+        },
+        body: provider === "claude" ? sessionBody(session) : "{}",
+      },
+    );
+    expect(response.status).toBe(200);
+    await response.text();
+  }
+
+  it("routes an API key only as a metered fallback and leaves it once the subscription recovers", async () => {
+    let now = 1_800_000_000_000;
+    let exhausted = false;
+    const seen: string[] = [];
+    const fixture = await createOAuthRequestFixture(
+      "claude",
+      async (_input, init) => {
+        const used = credential(init);
+        seen.push(used);
+        return exhausted && used === "oauth-old"
+          ? exhaustedResponse("claude", now + 60_000, now)
+          : Response.json({});
+      },
+      () => now,
+    );
+    const metered = await addApiAccount(fixture, "sk-metered", 0);
+    expect(fixture.account.lastResort).toBe(false);
+    expect(metered.lastResort).toBe(true);
+    await sendTo(fixture, "claude", "first");
+    exhausted = true;
+    await sendTo(fixture, "claude", "first");
+    await sendTo(fixture, "claude", "second");
+    now += 60_000;
+    exhausted = false;
+    await sendTo(fixture, "claude", "first");
+    await sendTo(fixture, "claude", "third");
+    await sendTo(fixture, "claude", "second");
+    expect(seen).toEqual([
+      "oauth-old",
+      "oauth-old",
+      "sk-metered",
+      "sk-metered",
+      "oauth-old",
+      "oauth-old",
+      "oauth-old",
+    ]);
+  });
+
+  it.each(["claude", "codex"] as const)(
+    "keeps %s last-resort accounts out of rotation until every regular account is exhausted",
+    async (provider) => {
+      let now = 1_800_000_000_000;
+      const resets = new Map<string, number>();
+      const seen: string[] = [];
+      const { fixture, ids } = await poolFixture(
+        provider,
+        ["sk-a", "sk-b", "sk-x", "sk-y"],
+        async (_input, init) => {
+          const used = credential(init);
+          seen.push(used);
+          const resetAt = resets.get(used);
+          return resetAt !== undefined && resetAt > now
+            ? exhaustedResponse(provider, resetAt, now)
+            : Response.json({});
+        },
+        () => now,
+      );
+      const [a, b, x, y] = ids;
+      if (
+        a === undefined ||
+        b === undefined ||
+        x === undefined ||
+        y === undefined
+      )
+        throw new Error("Expected four accounts.");
+      if (provider === "claude") {
+        await setLastResort(fixture, a, false);
+        await setLastResort(fixture, b, false);
+      } else {
+        await setLastResort(fixture, x, true);
+        await setLastResort(fixture, y, true);
+      }
+      await sendTo(fixture, provider, "one");
+      resets.set("sk-a", now + 60_000);
+      await sendTo(fixture, provider, "two");
+      resets.set("sk-b", now + 120_000);
+      await sendTo(fixture, provider, "three");
+      resets.set("sk-x", now + 180_000);
+      await sendTo(fixture, provider, "four");
+      expect(seen).toEqual([
+        "sk-a",
+        "sk-a",
+        "sk-b",
+        "sk-b",
+        "sk-x",
+        "sk-x",
+        "sk-y",
+      ]);
+      now += 60_000;
+      await sendTo(fixture, provider, "five");
+      await sendTo(fixture, provider, "four");
+      expect(seen.slice(7)).toEqual(["sk-a", "sk-a"]);
+      const status = statusSchema.parse(
+        await fixture.host.harness.behavior.callRpc("status.get", null),
+      );
+      expect(status.activeAccounts[provider]).toBe(a);
+    },
+  );
+
+  it.each([false, true])(
+    "keeps the sequential fallback unchanged when every account has lastResort %s",
+    async (lastResort) => {
+      let outage: string | null = null;
+      const seen: string[] = [];
+      const { fixture, ids } = await poolFixture(
+        "claude",
+        ["sk-a", "sk-b", "sk-c"],
+        async (_input, init) => {
+          const used = credential(init);
+          seen.push(used);
+          return Response.json({}, { status: used === outage ? 503 : 200 });
+        },
+        () => 1_800_000_000_000,
+      );
+      for (const id of ids) await setLastResort(fixture, id, lastResort);
+      await sendTo(fixture, "claude", "one");
+      outage = "sk-a";
+      await sendTo(fixture, "claude", "two");
+      outage = null;
+      await sendTo(fixture, "claude", "three");
+      await sendTo(fixture, "claude", "one");
+      outage = "sk-b";
+      await sendTo(fixture, "claude", "four");
+      expect(seen).toEqual([
+        "sk-a",
+        "sk-a",
+        "sk-b",
+        "sk-b",
+        "sk-a",
+        "sk-b",
+        "sk-c",
+      ]);
+    },
+  );
+
+  it("switches an account at its own threshold and back to the pool threshold when cleared", async () => {
+    const seen: string[] = [];
+    const { fixture, ids } = await poolFixture(
+      "claude",
+      ["sk-reserve", "sk-other"],
+      async (_input, init) => {
+        const used = credential(init);
+        seen.push(used);
+        return Response.json(
+          {},
+          {
+            headers:
+              used === "sk-reserve"
+                ? {
+                    "anthropic-ratelimit-unified-7d-utilization": "0.75",
+                    "anthropic-ratelimit-unified-7d-reset": "4102444800",
+                    "anthropic-ratelimit-unified-7d-status": "allowed",
+                  }
+                : {},
+          },
+        );
+      },
+      () => 1_800_000_000_000,
+    );
+    const [reserve, other] = ids;
+    if (reserve === undefined || other === undefined)
+      throw new Error("Expected two accounts.");
+    const listStatus = async () =>
+      z
+        .array(accountSummarySchema)
+        .parse(
+          await fixture.host.harness.behavior.callRpc("account.list", null),
+        )
+        .map((account) => [account.switchThreshold, account.status]);
+    await sendTo(fixture, "claude", "one");
+    expect(await listStatus()).toEqual([
+      [null, "ready"],
+      [null, "ready"],
+    ]);
+    const set = await fixture.host.harness.behavior.runCli([
+      "account",
+      "threshold",
+      reserve,
+      "0.7",
+      "--json",
+    ]);
+    expect(set.exitCode, set.stderr).toBe(0);
+    expect(
+      cliAccountSchema.parse(JSON.parse(set.stdout)).account,
+    ).toMatchObject({ id: reserve, switchThreshold: 0.7 });
+    expect(await listStatus()).toEqual([
+      [0.7, "exhausted"],
+      [null, "ready"],
+    ]);
+    await sendTo(fixture, "claude", "two");
+    await sendTo(fixture, "claude", "one");
+    expect(seen).toEqual(["sk-reserve", "sk-other", "sk-other"]);
+    const cleared = await fixture.host.harness.behavior.runCli([
+      "account",
+      "threshold",
+      reserve,
+      "--clear",
+    ]);
+    expect(cleared.exitCode, cleared.stderr).toBe(0);
+    expect(cleared.stdout).toContain("uses the pool-wide switch threshold");
+    expect(await listStatus()).toEqual([
+      [null, "ready"],
+      [null, "ready"],
+    ]);
+    expect(
+      await fixture.host.harness.behavior.callRpc(
+        "account.setSwitchThreshold",
+        { accountId: other, switchThreshold: 0.5 },
+      ),
+    ).toMatchObject({ account: { id: other, switchThreshold: 0.5 } });
+    await expect(
+      fixture.host.harness.behavior.callRpc("account.setSwitchThreshold", {
+        accountId: other,
+        switchThreshold: 0,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("reports each provider's active account in status and account listings", async () => {
+    const { fixture, ids } = await poolFixture(
+      "claude",
+      ["sk-first", "sk-second"],
+      async () => Response.json({}),
+      () => 1_800_000_000_000,
+    );
+    const [first, second] = ids;
+    const before = statusReportSchema.parse(
+      JSON.parse(
+        (await fixture.host.harness.behavior.runCli(["status", "--json"]))
+          .stdout,
+      ),
+    );
+    expect(before.activeAccounts).toEqual({ claude: null, codex: null });
+    expect(before.accounts.map((account) => account.active)).toEqual([
+      false,
+      false,
+    ]);
+    const statusText = await fixture.host.harness.behavior.runCli(["status"]);
+    expect(statusText.stdout).toContain("Active Claude account: none");
+    await sendTo(fixture, "claude", "one");
+    const after = statusSchema.parse(
+      await fixture.host.harness.behavior.callRpc("status.get", null),
+    );
+    expect(after.activeAccounts).toEqual({ claude: first, codex: null });
+    const listed = z
+      .object({ accounts: z.array(accountSummarySchema) })
+      .strict()
+      .parse(
+        JSON.parse(
+          (
+            await fixture.host.harness.behavior.runCli([
+              "account",
+              "list",
+              "--json",
+            ])
+          ).stdout,
+        ),
+      );
+    expect(
+      listed.accounts.map((account) => [account.id, account.active]),
+    ).toEqual([
+      [first, true],
+      [second, false],
+    ]);
+    const table = (
+      await fixture.host.harness.behavior.runCli(["account", "list"])
+    ).stdout.split("\n");
+    expect(table[0]).toContain("Priority\tActive\tLast resort\tThreshold\t");
+    expect(table[1]).toContain(`${first}\t`);
+    expect(table[1]).toContain("\t100\ttrue\ttrue\t-\t");
+    expect(table[2]).toContain("\t100\tfalse\ttrue\t-\t");
+    expect(
+      (await fixture.host.harness.behavior.runCli(["status"])).stdout,
+    ).toContain(`Active Claude account: Claude API key (${first})`);
+  });
+
+  it("validates the last-resort and threshold commands", async () => {
+    const { fixture, ids } = await poolFixture(
+      "claude",
+      ["sk-first"],
+      async () => Response.json({}),
+      () => 1_800_000_000_000,
+    );
+    const [first] = ids;
+    if (first === undefined) throw new Error("Expected an account.");
+    const run = (argv: string[]) => fixture.host.harness.behavior.runCli(argv);
+    const missing = await run(["account", "threshold", first, "--json"]);
+    expect(missing.exitCode).toBe(1);
+    expect(JSON.parse(missing.stdout)).toMatchObject({
+      ok: false,
+      error: {
+        code: "missing_required",
+        message: "missing required arguments: <value> or --clear",
+      },
+    });
+    for (const value of ["0", "1.5", "-0.2", "abc"]) {
+      const invalid = await run(["account", "threshold", first, value]);
+      expect(invalid.exitCode, value).toBe(1);
+      expect(invalid.stderr).toContain(
+        "Expected a number above 0 and at most 1",
+      );
+    }
+    const both = await run(["account", "threshold", first, "0.5", "--clear"]);
+    expect(both.exitCode).toBe(1);
+    expect(both.stderr).toContain("Pass either <value> or --clear, not both.");
+    const unknown = await run([
+      "account",
+      "last-resort",
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "--json",
+    ]);
+    expect(unknown.exitCode).toBe(1);
+    expect(JSON.parse(unknown.stdout)).toMatchObject({
+      ok: false,
+      error: { code: "account_not_found" },
+    });
+    const regular = await run(["account", "last-resort", first, "--off"]);
+    expect(regular.stdout).toBe("Claude API key is now a regular account.\n");
+    const help = await run(["--help"]);
+    expect(help.stdout).toContain("bb pool account last-resort");
+    expect(help.stdout).toContain("bb pool account threshold");
+  });
+});
+
 it("logs a sanitized transport cause when pooled fetch fails", async () => {
   const fixture = await createFixture({
     upstreamUrl: "https://upstream.example",

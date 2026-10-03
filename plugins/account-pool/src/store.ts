@@ -20,7 +20,13 @@ import {
 
 const ACCOUNTS_KEY = "accounts:v1";
 const ACCOUNT_LAST_USED_PERSIST_MS = 60 * 1_000;
-const accountsSchema = z.array(accountSchema);
+const storedAccountSchema = accountSchema
+  .extend({ lastResort: z.boolean().optional() })
+  .transform(({ lastResort, ...account }): Account => ({
+    ...account,
+    lastResort: lastResort ?? account.kind === "api-key",
+  }));
+const accountsSchema = z.array(storedAccountSchema);
 const HUB_TOKEN_PREFIX = "hub-token-";
 const HUB_TOKEN_GRACE_MS = 10 * 60 * 1_000;
 const HUB_TOKEN_LAST_USED_PERSIST_MS = 60 * 1_000;
@@ -118,6 +124,20 @@ export class AccountStore {
 
   async setPriority(id: string, priority: number): Promise<Account | null> {
     return this.update(id, (account) => ({ ...account, priority }));
+  }
+
+  async setLastResort(
+    id: string,
+    lastResort: boolean,
+  ): Promise<Account | null> {
+    return this.update(id, (account) => ({ ...account, lastResort }));
+  }
+
+  async setSwitchThreshold(
+    id: string,
+    switchThreshold: number | null,
+  ): Promise<Account | null> {
+    return this.update(id, (account) => ({ ...account, switchThreshold }));
   }
 
   async setSubscriptionType(

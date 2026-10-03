@@ -62,6 +62,58 @@ describe("AccountStore", () => {
     ]);
   });
 
+  it("treats stored API keys as last resort until an explicit choice is saved", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-store-"));
+    const host = createFakePluginHost({ pluginId: "account-pool", dataDir });
+    const store = new AccountStore(
+      host.bb.storage.kv,
+      path.join(dataDir, "secrets"),
+    );
+    cleanups.push(async () => {
+      await host.harness.lifecycle.dispose();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    });
+    const stored = (id: string, kind: "oauth" | "api-key") => ({
+      id,
+      provider: "claude",
+      kind,
+      label: id,
+      email: null,
+      subscriptionType: null,
+      rateLimitTier: null,
+      enabled: true,
+      priority: 100,
+      createdAt: 1,
+    });
+    await host.bb.storage.kv.set("accounts:v1", [
+      stored("11111111-1111-4111-8111-111111111111", "oauth"),
+      stored("22222222-2222-4222-8222-222222222222", "api-key"),
+      {
+        ...stored("33333333-3333-4333-8333-333333333333", "api-key"),
+        lastResort: false,
+        switchThreshold: 0.7,
+      },
+    ]);
+
+    expect(
+      (await store.list()).map((account) => [
+        account.kind,
+        account.lastResort,
+        account.switchThreshold,
+      ]),
+    ).toEqual([
+      ["oauth", false, null],
+      ["api-key", true, null],
+      ["api-key", false, 0.7],
+    ]);
+    await store.setLastResort("22222222-2222-4222-8222-222222222222", false);
+    expect((await store.list()).map((account) => account.lastResort)).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
   it("preserves both accounts added concurrently", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-store-"));
     const host = createFakePluginHost({ pluginId: "account-pool", dataDir });
@@ -87,6 +139,8 @@ describe("AccountStore", () => {
       rateLimitTier: null,
       enabled: true,
       priority: 100,
+      lastResort: true,
+      switchThreshold: null,
     });
 
     const [first, second] = await Promise.all([

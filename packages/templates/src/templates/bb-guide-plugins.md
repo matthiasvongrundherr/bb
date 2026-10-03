@@ -41,6 +41,8 @@ bb pool account enable <id>
 bb pool account disable <id>
 bb pool account priority <id> <n>
 bb pool account reorder <claude|codex> <id>...
+bb pool account last-resort <id> [--off]
+bb pool account threshold <id> <value>|--clear
 bb pool account refresh <id>
 bb pool status [--json]
 bb pool routing <claude|codex> [--off]
@@ -114,6 +116,14 @@ Spending-control and explicit credit-depletion restrictions still block routing;
 account/status JSON exposes them under `usageRestriction`. Both providers show
 an “Extra usage available” pill when allowance is reported available. The pill
 does not indicate current billing activity.
+
+Last-resort accounts take traffic only while no regular account of the same
+provider is eligible for the request; conversations and the provider cursor
+leave them with their next request once one is. API-key accounts start as last
+resort. `bb pool account last-resort <id> [--off]` changes it, and
+`bb pool account threshold <id> <value>|--clear` sets one account's own switch
+threshold. `bb pool status` and `bb pool account list` show each provider's
+active account.
 
 Use the up/down arrows in Account Pooler settings, or
 `bb pool account reorder <claude|codex> <id>...`, to set the complete order for

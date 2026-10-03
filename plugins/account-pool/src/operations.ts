@@ -67,6 +67,8 @@ export class PoolOperations {
           rateLimitTier: null,
           enabled: true,
           priority: input.priority,
+          lastResort: true,
+          switchThreshold: null,
         },
         { kind: "api-key", apiKey: input.source.apiKey },
       );
@@ -89,6 +91,8 @@ export class PoolOperations {
         rateLimitTier: imported.rateLimitTier,
         enabled: true,
         priority: input.priority,
+        lastResort: false,
+        switchThreshold: null,
       },
       imported.secret,
     );
@@ -109,6 +113,8 @@ export class PoolOperations {
         rateLimitTier: authenticated.rateLimitTier,
         enabled: true,
         priority: 100,
+        lastResort: false,
+        switchThreshold: null,
       },
       {
         kind: "oauth",
@@ -137,6 +143,8 @@ export class PoolOperations {
         rateLimitTier: null,
         enabled: true,
         priority: 100,
+        lastResort: false,
+        switchThreshold: null,
       },
       {
         kind: "oauth",
@@ -186,6 +194,24 @@ export class PoolOperations {
 
   async setPriority(id: string, priority: number): Promise<Account | null> {
     const account = await this.accounts.setPriority(id, priority);
+    if (account !== null) this.onAccountsChanged();
+    return account;
+  }
+
+  async setLastResort(
+    id: string,
+    lastResort: boolean,
+  ): Promise<Account | null> {
+    const account = await this.accounts.setLastResort(id, lastResort);
+    if (account !== null) this.onAccountsChanged();
+    return account;
+  }
+
+  async setSwitchThreshold(
+    id: string,
+    switchThreshold: number | null,
+  ): Promise<Account | null> {
+    const account = await this.accounts.setSwitchThreshold(id, switchThreshold);
     if (account !== null) this.onAccountsChanged();
     return account;
   }

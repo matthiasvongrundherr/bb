@@ -143,6 +143,8 @@ export const accountSchema = z
     rateLimitTier: z.string().nullable(),
     enabled: z.boolean(),
     priority: z.number().int(),
+    lastResort: z.boolean(),
+    switchThreshold: switchThresholdSchema.nullable().default(null),
     createdAt: z.number().int().nonnegative(),
     lastUsedAt: z.number().int().nonnegative().nullable().default(null),
     lastUsedHostId: z.string().min(1).nullable().default(null),
@@ -216,6 +218,7 @@ export const accountSummarySchema = accountSchema.extend({
   lastUsedHostName: z.string().min(1).nullable(),
   ...quotaFieldsShape,
   inFlight: z.number().int().nonnegative(),
+  active: z.boolean(),
   status: z.enum(["disabled", "ready", "held", "exhausted", "error"]),
 });
 
@@ -244,6 +247,15 @@ export const routedThreadStatusSchema = z
 
 export type RoutedThreadStatus = z.infer<typeof routedThreadStatusSchema>;
 
+export const activeAccountsSchema = z
+  .object({
+    claude: z.string().uuid().nullable(),
+    codex: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type ActiveAccounts = z.infer<typeof activeAccountsSchema>;
+
 export const statusSchema = z
   .object({
     route: z.string(),
@@ -251,6 +263,7 @@ export const statusSchema = z
     inFlight: z.number().int().nonnegative(),
     accepting: z.boolean(),
     hosts: z.array(hubTokenSummarySchema),
+    activeAccounts: activeAccountsSchema,
     accounts: z.array(accountSummarySchema),
     routing: z.object({ claude: z.boolean(), codex: z.boolean() }).strict(),
     parent: z
@@ -336,6 +349,17 @@ export const accountIdInputSchema = z
 
 export const accountPriorityInputSchema = z
   .object({ accountId: z.string().uuid(), priority: z.number().int() })
+  .strict();
+
+export const accountLastResortInputSchema = z
+  .object({ accountId: z.string().uuid(), lastResort: z.boolean() })
+  .strict();
+
+export const accountSwitchThresholdInputSchema = z
+  .object({
+    accountId: z.string().uuid(),
+    switchThreshold: switchThresholdSchema.nullable(),
+  })
   .strict();
 
 export const accountReorderInputSchema = z

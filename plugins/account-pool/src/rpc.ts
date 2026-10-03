@@ -5,10 +5,12 @@ import {
   accountPoolConfigSchema,
   accountPoolConfigSetInputSchema,
   accountIdInputSchema,
+  accountLastResortInputSchema,
   accountPriorityInputSchema,
   accountReorderInputSchema,
   accountSchema,
   accountSummarySchema,
+  accountSwitchThresholdInputSchema,
   bypassInputSchema,
   codexLoginCancelSchema,
   codexLoginPollInputSchema,
@@ -50,6 +52,14 @@ export const accountPoolRpcContract = defineRpcContract({
   },
   "account.setPriority": {
     input: accountPriorityInputSchema,
+    output: z.object({ account: accountSchema.nullable() }).strict(),
+  },
+  "account.setLastResort": {
+    input: accountLastResortInputSchema,
+    output: z.object({ account: accountSchema.nullable() }).strict(),
+  },
+  "account.setSwitchThreshold": {
+    input: accountSwitchThresholdInputSchema,
     output: z.object({ account: accountSchema.nullable() }).strict(),
   },
   "account.reorder": {
@@ -132,6 +142,12 @@ export function createRpcHandlers(
     }),
     "account.setPriority": async ({ accountId, priority }) => ({
       account: await operations.setPriority(accountId, priority),
+    }),
+    "account.setLastResort": async ({ accountId, lastResort }) => ({
+      account: await operations.setLastResort(accountId, lastResort),
+    }),
+    "account.setSwitchThreshold": async ({ accountId, switchThreshold }) => ({
+      account: await operations.setSwitchThreshold(accountId, switchThreshold),
     }),
     "account.refreshUsage": async ({ accountId }) => ({
       account: await operations.refreshUsage(accountId),

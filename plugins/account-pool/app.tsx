@@ -74,18 +74,29 @@ import {
   modelFamilySchema,
   statusSchema,
 } from "./src/contracts.js";
-import { blockingResetAt } from "./src/quota.js";
+import { blockingResetAt, effectiveSwitchThreshold } from "./src/quota.js";
 import {
   ACCOUNT_POOL_ACCOUNTS_CHANGED,
   ACCOUNT_POOL_CONFIG_CHANGED,
 } from "./src/realtime.js";
 
 type DialogState =
-  | { kind: "account" | "priority" | "remove"; accountId: string }
+  | {
+      kind: "account" | "priority" | "threshold" | "remove";
+      accountId: string;
+    }
   | { kind: "claude-login" | "codex-login" | "api-key" }
   | null;
 
 type ConfigField = Exclude<keyof AccountPoolConfig, "parentMode">;
+
+type AccountAction =
+  | "toggle"
+  | "priority"
+  | "lastResort"
+  | "threshold"
+  | "refresh"
+  | "remove";
 
 const PROVIDERS: Array<{
   id: PoolProvider;
@@ -390,11 +401,12 @@ function AccountRow({
   threshold: number;
   pending: boolean;
   refreshing: boolean;
-  onAction: (action: "toggle" | "priority" | "refresh" | "remove") => void;
+  onAction: (action: AccountAction) => void;
   onOpen: () => void;
   reorderDisabled: boolean;
 }) {
-  const status = statusPresentation(account, threshold);
+  const accountThreshold = effectiveSwitchThreshold(account, threshold);
+  const status = statusPresentation(account, accountThreshold);
   const slots = quotaSlots(account);
   const email = secondaryEmail(account);
   const {
@@ -454,6 +466,10 @@ function AccountRow({
               {account.extraUsage?.status === "allowed" ? (
                 <SettingsBadge>Extra usage available</SettingsBadge>
               ) : null}
+              {account.active ? <SettingsBadge>Active</SettingsBadge> : null}
+              {account.lastResort ? (
+                <SettingsBadge>Last resort</SettingsBadge>
+              ) : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-subtle-foreground/75">
               <span className="inline-flex shrink-0 items-center gap-1.5">
@@ -471,7 +487,7 @@ function AccountRow({
               <QuotaValue
                 key={slot.key}
                 slot={slot}
-                threshold={threshold}
+                threshold={accountThreshold}
                 refreshing={refreshing}
               />
             ))}
@@ -502,6 +518,22 @@ function AccountRow({
             >
               <Icon name="ListView" />
               Set priority…
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={pending}
+              onSelect={() => onAction("lastResort")}
+            >
+              <Icon name={account.lastResort ? "ArrowUp" : "ArrowDown"} />
+              {account.lastResort
+                ? "Use as regular account"
+                : "Use as last resort"}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={pending}
+              onSelect={() => onAction("threshold")}
+            >
+              <Icon name="ChartColumn" />
+              Set switch threshold…
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={pending}
@@ -887,6 +919,7 @@ function AccountPoolSettings() {
   const [pastedCode, setPastedCode] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [priority, setPriority] = useState("100");
+  const [accountThreshold, setAccountThreshold] = useState("");
   const [countdown, setCountdown] = useState(0);
   const mounted = useRef(true);
   const threshold =
@@ -970,9 +1003,16 @@ function AccountPoolSettings() {
   const selectedAccount =
     dialog?.kind === "account" ||
     dialog?.kind === "priority" ||
+    dialog?.kind === "threshold" ||
     dialog?.kind === "remove"
       ? (accounts.find((account) => account.id === dialog.accountId) ?? null)
       : null;
+  const accountThresholdValue = Number(accountThreshold);
+  const accountThresholdValid =
+    accountThreshold.trim().length > 0 &&
+    Number.isFinite(accountThresholdValue) &&
+    accountThresholdValue > 0 &&
+    accountThresholdValue <= 1;
   async function run(key: string, action: () => Promise<void>): Promise<void> {
     if (pending !== null) return;
     setPending(key);
@@ -1079,11 +1119,18 @@ function AccountPoolSettings() {
   }
   async function accountAction(
     account: AccountSummary,
-    action: "toggle" | "priority" | "refresh" | "remove",
+    action: AccountAction,
   ): Promise<void> {
     if (action === "priority") {
       setPriority(String(account.priority));
       setDialog({ kind: "priority", accountId: account.id });
+      return;
+    }
+    if (action === "threshold") {
+      setAccountThreshold(
+        account.switchThreshold === null ? "" : String(account.switchThreshold),
+      );
+      setDialog({ kind: "threshold", accountId: account.id });
       return;
     }
     if (action === "remove") {
@@ -1094,6 +1141,11 @@ function AccountPoolSettings() {
       if (action === "toggle")
         await rpc.call(account.enabled ? "account.disable" : "account.enable", {
           id: account.id,
+        });
+      if (action === "lastResort")
+        await rpc.call("account.setLastResort", {
+          accountId: account.id,
+          lastResort: !account.lastResort,
         });
       if (action === "refresh")
         await rpc.call("account.refreshUsage", { accountId: account.id });
@@ -1469,6 +1521,67 @@ function AccountPoolSettings() {
             />
           </DialogFrame>
         ) : null}
+        {dialog?.kind === "threshold" && selectedAccount !== null ? (
+          <DialogFrame
+            title="Set switch threshold"
+            footer={
+              <>
+                <Button
+                  variant="outline"
+                  disabled={
+                    selectedAccount.switchThreshold === null || pending !== null
+                  }
+                  onClick={() =>
+                    void run(`threshold-${selectedAccount.id}`, async () => {
+                      await rpc.call("account.setSwitchThreshold", {
+                        accountId: selectedAccount.id,
+                        switchThreshold: null,
+                      });
+                      setDialog(null);
+                    })
+                  }
+                >
+                  Use pool default
+                </Button>
+                <span className="flex-1" />
+                <Button variant="outline" onClick={closeDialog}>
+                  Cancel
+                </Button>
+                <Button
+                  disabled={!accountThresholdValid || pending !== null}
+                  onClick={() =>
+                    void run(`threshold-${selectedAccount.id}`, async () => {
+                      await rpc.call("account.setSwitchThreshold", {
+                        accountId: selectedAccount.id,
+                        switchThreshold: accountThresholdValue,
+                      });
+                      setDialog(null);
+                    })
+                  }
+                >
+                  Save
+                </Button>
+              </>
+            }
+          >
+            <p className="text-sm text-muted-foreground">
+              Stop selecting this account once one of its quota windows reaches
+              this fraction, instead of the pool default of {threshold}. Use a
+              lower value to keep part of the account&apos;s quota free for
+              other tools.
+            </p>
+            <Input
+              type="number"
+              min="0.01"
+              max="1"
+              step="0.01"
+              aria-label="Account switch threshold"
+              placeholder={String(threshold)}
+              value={accountThreshold}
+              onChange={(event) => setAccountThreshold(event.target.value)}
+            />
+          </DialogFrame>
+        ) : null}
         {dialog?.kind === "api-key" ? (
           <DialogFrame
             title="Add an Anthropic API key"
@@ -1602,6 +1715,7 @@ function AccountDialog({
   threshold: number;
   act: (action: "toggle" | "refresh" | "remove") => void;
 }) {
+  const accountThreshold = effectiveSwitchThreshold(account, threshold);
   const shared = (
     utilization: number | null,
     resetAt: number | null,
@@ -1644,8 +1758,10 @@ function AccountDialog({
       <div className="flex items-center gap-2">
         <SettingsBadge>{tier(account)}</SettingsBadge>
         <SettingsBadge>
-          {statusPresentation(account, threshold).label}
+          {statusPresentation(account, accountThreshold).label}
         </SettingsBadge>
+        {account.active ? <SettingsBadge>Active</SettingsBadge> : null}
+        {account.lastResort ? <SettingsBadge>Last resort</SettingsBadge> : null}
       </div>
       <div className="space-y-4">
         {account.provider === "codex" ? (
@@ -1659,7 +1775,7 @@ function AccountDialog({
                 key={window.slot}
                 label={windowLongLabel(window)}
                 quota={window}
-                threshold={threshold}
+                threshold={accountThreshold}
               />
             ))
           )
@@ -1672,7 +1788,7 @@ function AccountDialog({
                 account.fiveHourResetAt,
                 account.fiveHourStatus,
               )}
-              threshold={threshold}
+              threshold={accountThreshold}
             />
             <QuotaDetail
               label="7 day"
@@ -1681,7 +1797,7 @@ function AccountDialog({
                 account.sevenDayResetAt,
                 account.sevenDayStatus,
               )}
-              threshold={threshold}
+              threshold={accountThreshold}
             />
             {modelFamilySchema.options.flatMap((family) =>
               account.familyWeekly[family] === null
@@ -1691,7 +1807,7 @@ function AccountDialog({
                       key={family}
                       label={FAMILY_LABELS[family]}
                       quota={account.familyWeekly[family]}
-                      threshold={threshold}
+                      threshold={accountThreshold}
                     />,
                   ],
             )}
@@ -1713,6 +1829,16 @@ function AccountDialog({
         </dd>
         <dt className="text-muted-foreground">Priority</dt>
         <dd>{account.priority}</dd>
+        <dt className="text-muted-foreground">Routing</dt>
+        <dd>
+          {account.lastResort
+            ? "Last resort: only while no regular account is eligible"
+            : "Regular"}
+        </dd>
+        <dt className="text-muted-foreground">Switch threshold</dt>
+        <dd>
+          {`${Math.round(accountThreshold * 100)}%${account.switchThreshold === null ? " · pool default" : " · this account"}`}
+        </dd>
         <dt className="text-muted-foreground">Last used</dt>
         <dd>
           {account.lastUsedAt === null

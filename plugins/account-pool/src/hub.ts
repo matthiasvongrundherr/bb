@@ -3,6 +3,7 @@ import type {
   AccountPoolConfig,
   AccountQuota,
   AccountSecret,
+  ActiveAccounts,
   ModelFamily,
   PoolProvider,
   PoolStatus,
@@ -23,6 +24,7 @@ import type {
 import {
   accountStatus,
   blockingResetAt,
+  effectiveSwitchThreshold,
   governingWeeklyResetAt,
   hasExtraUsage,
   isQuotaExhausted,
@@ -307,7 +309,13 @@ export class AccountPoolHub {
         return false;
       const quota = this.options.quotas.get(account.id);
       return (
-        quota.error === null && isQuotaExhausted(quota, family, threshold, now)
+        quota.error === null &&
+        isQuotaExhausted(
+          quota,
+          family,
+          effectiveSwitchThreshold(account, threshold),
+          now,
+        )
       );
     });
     await Promise.all(
@@ -382,12 +390,26 @@ export class AccountPoolHub {
     const accounts = (await this.options.accounts.list()).sort(
       (left, right) => left.priority - right.priority,
     );
+    const activeAccountId = (provider: PoolProvider): string | null => {
+      const accountId = this.activeAccounts.get(provider)?.accountId;
+      return (
+        accounts.find(
+          (account) =>
+            account.provider === provider && account.id === accountId,
+        )?.id ?? null
+      );
+    };
+    const activeAccounts: ActiveAccounts = {
+      claude: activeAccountId("claude"),
+      codex: activeAccountId("codex"),
+    };
     return {
       route: ROUTE,
       enabledAccountCount: accounts.filter((account) => account.enabled).length,
       inFlight: this.inFlightCount(),
       accepting: this.accepting,
       hosts: await this.options.hubTokens.list(),
+      activeAccounts,
       accounts: accounts.map((account) => {
         const quota = this.options.quotas.get(account.id);
         const { accountId: _accountId, ...quotaFields } = quota;
@@ -396,7 +418,13 @@ export class AccountPoolHub {
           lastUsedHostName: null,
           ...quotaFields,
           inFlight: this.inFlightByAccount.get(account.id) ?? 0,
-          status: accountStatus(account, quota, settings.switchThreshold, now),
+          active: activeAccounts[account.provider] === account.id,
+          status: accountStatus(
+            account,
+            quota,
+            effectiveSwitchThreshold(account, settings.switchThreshold),
+            now,
+          ),
         };
       }),
     };
@@ -835,28 +863,30 @@ export class AccountPoolHub {
     );
     signal.throwIfAborted();
     const now = this.options.now();
-    const threshold = this.options.getSettings().switchThreshold;
+    const poolThreshold = this.options.getSettings().switchThreshold;
     const available = accounts
       .filter((account) => account.provider === provider && account.enabled)
       .map((account) => ({
         account,
         quota: this.options.quotas.get(account.id),
+        threshold: effectiveSwitchThreshold(account, poolThreshold),
       }))
       .filter(
         ({ quota }) => quota.error === null && !isUsageRestricted(quota, now),
       )
       .filter(
-        ({ quota }) =>
+        ({ quota, threshold }) =>
           !isSharedQuotaExhausted(quota, threshold, now) ||
           hasExtraUsage(quota),
       );
     let eligible = available.filter(
-      ({ quota }) =>
+      ({ quota, threshold }) =>
         !isQuotaExhausted(quota, family, threshold, now) ||
         hasExtraUsage(quota),
     );
     const included = eligible.filter(
-      ({ quota }) => !isQuotaExhausted(quota, family, threshold, now),
+      ({ quota, threshold }) =>
+        !isQuotaExhausted(quota, family, threshold, now),
     );
     if (
       included.some(
@@ -875,6 +905,17 @@ export class AccountPoolHub {
     const candidates = unattempted.filter(
       ({ quota }) => quota.heldUntil === null || quota.heldUntil <= now,
     );
+    const reserved = new Set(
+      candidates.some(({ account }) => !account.lastResort)
+        ? eligible
+            .filter(({ account }) => account.lastResort)
+            .map(({ account }) => account.id)
+        : [],
+    );
+    const routable = (candidate: (typeof eligible)[number] | undefined) =>
+      candidate === undefined || reserved.has(candidate.account.id)
+        ? undefined
+        : candidate;
     let binding =
       affinityKey === null ? undefined : this.affinityBindings.get(affinityKey);
     const boundAccountId =
@@ -883,7 +924,9 @@ export class AccountPoolHub {
         : null;
     const bound =
       boundAccountId !== null
-        ? eligible.find(({ account }) => account.id === boundAccountId)
+        ? routable(
+            eligible.find(({ account }) => account.id === boundAccountId),
+          )
         : undefined;
     let inherited: (typeof candidates)[number] | undefined;
     if (bound === undefined && parentAffinityKey !== null) {
@@ -892,14 +935,14 @@ export class AccountPoolHub {
         parent !== undefined &&
         now - parent.lastUsedAt < AFFINITY_IDLE_TTL_MS
       ) {
-        inherited = unattempted.find(
-          ({ account }) => account.id === parent.accountId,
+        inherited = routable(
+          unattempted.find(({ account }) => account.id === parent.accountId),
         );
       }
     }
     let active = this.activeAccounts.get(provider);
-    const activeAccount = eligible.find(
-      ({ account }) => account.id === active?.accountId,
+    const activeAccount = routable(
+      eligible.find(({ account }) => account.id === active?.accountId),
     );
     const anchorId = previousAccountId ?? boundAccountId ?? active?.accountId;
     const anchorIndex = accounts.findIndex(
@@ -911,7 +954,9 @@ export class AccountPoolHub {
     ];
     const next = ordered
       .map((account) =>
-        candidates.find((candidate) => candidate.account.id === account.id),
+        routable(
+          candidates.find((candidate) => candidate.account.id === account.id),
+        ),
       )
       .find((candidate) => candidate !== undefined);
     const selected =
@@ -954,7 +999,7 @@ export class AccountPoolHub {
     routing.active ??= active;
     const familyDetour = (accountId: string | null) =>
       available.some(
-        ({ account, quota }) =>
+        ({ account, quota, threshold }) =>
           account.id === accountId &&
           !isSharedQuotaExhausted(quota, threshold, now) &&
           isQuotaExhausted(quota, family, threshold, now),
@@ -1249,12 +1294,13 @@ export class AccountPoolHub {
       );
     }
     const now = this.options.now();
-    const threshold = this.options.getSettings().switchThreshold;
+    const poolThreshold = this.options.getSettings().switchThreshold;
     const next = accounts
       .filter((account) => account.enabled)
       .flatMap((account) => {
         const quota = this.options.quotas.get(account.id);
         if (quota.error !== null) return [];
+        const threshold = effectiveSwitchThreshold(account, poolThreshold);
         const quotaResetAt = hasExtraUsage(quota)
           ? null
           : blockingResetAt(quota, family, threshold, now);

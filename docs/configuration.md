@@ -1173,8 +1173,9 @@ login. Rotate one machine's token with
 for ten minutes so in-flight requests can drain. Bypass or restore routing for
 one thread with `bb pool bypass <thread-id>` or
 `bb pool bypass <thread-id> --off`. Account listing, enable, disable, removal,
-priority changes, and usage refreshes are available through
-`bb pool account list|enable|disable|remove|priority|refresh`.
+priority changes, last-resort and per-account threshold changes, and usage
+refreshes are available through
+`bb pool account list|enable|disable|remove|priority|last-resort|threshold|refresh`.
 Provider routing is independently persisted and defaults on. Use
 `bb pool routing <claude|codex> --off` to stop contributing pool environment
 and health for one provider, and omit `--off` to enable it again.
@@ -1200,6 +1201,17 @@ family without moving the session's main pin or the provider cursor. The cursor
 and session pins survive hub restarts. Session pins expire after 30 idle minutes,
 and the pool retains the 4,096 most recently used pins.
 
+Last-resort accounts take traffic only while no regular account of the same
+provider is eligible for the request; a conversation pinned to one or a
+provider cursor on one moves to the next regular account with its next
+request. When no regular account is eligible, last-resort accounts run in their
+usual priority order. API-key accounts, including existing ones, start as last
+resort and OAuth accounts as regular; `bb pool account last-resort <id> [--off]`
+changes it. `bb pool account threshold <id> <value>|--clear` sets or clears one
+account's own switch threshold. `bb pool status` and `bb pool account list`
+show each provider's active account, reported as `activeAccounts` and
+`active` in JSON.
+
 Use the up/down arrows in Account Pooler settings, or
 `bb pool account reorder <claude|codex> <id>...`, to set the complete order for
 one provider. Include disabled accounts too. Reordering changes the next failover
@@ -1209,7 +1221,8 @@ sets an individual priority; the same operations are available through the
 
 Three plugin-owned configuration values control routing. `switchThreshold` is
 the shared or requested model-family quota fraction at which an account stops
-receiving matching traffic and defaults to `0.98`.
+receiving matching traffic and defaults to `0.98`; an account's own threshold
+from `bb pool account threshold` replaces it for that account.
 `anthropicUpstreamBaseUrl` defaults to `https://api.anthropic.com` and
 `codexUpstreamBaseUrl` defaults to
 `https://chatgpt.com/backend-api/codex`. Codex uses the hub's HTTP Responses

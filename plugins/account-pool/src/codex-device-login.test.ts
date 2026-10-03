@@ -70,6 +70,8 @@ function summary(account: CodexDeviceAccount): AccountSummary {
     rateLimitTier: null,
     enabled: true,
     priority: 100,
+    lastResort: false,
+    switchThreshold: null,
     createdAt: 1,
     lastUsedAt: null,
     lastUsedHostId: null,
@@ -95,6 +97,7 @@ function summary(account: CodexDeviceAccount): AccountSummary {
     heldUntil: null,
     error: null,
     inFlight: 0,
+    active: false,
     status: "ready",
   };
 }
